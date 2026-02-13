@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Up the Down Staircase -- Nightmare</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: black;
+  font-family: monospace;
+}
+
+/* UI */
+#ui {
+position: absolute;
+top: 15px;
+left: 15px;
+z-index: 10;
+}
+button {
+display: block;
+margin-bottom: 10px;
+padding: 10px 14px;
+background: rgba(0,0,0,0.7);
+border: 2px solid #00ffff;
+color: #00ffff;
+font-weight: bold;
+cursor: pointer;
+}
+button:hover {
+background: rgba(0,255,255,0.2);
+}
+
+/* GRIN */
+#cheshire {
+position: absolute;
+right: 8%;
+bottom: 20%;
+pointer-events: none;
+transition: transform 0.1s;
+}
+
+.eye {
+width: 28px;
+height: 32px;
+background: radial-gradient(circle, #ffff00 20%, #ff00ff 55%, transparent 70%);
+border-radius: 50%;
+display: inline-block;
+margin: 0 20px;
+position: relative;
+box-shadow: 0 0 25px #ff00ff;
+}
+
+.pupil {
+width: 12px;
+height: 12px;
+background: radial-gradient(circle, #000 40%, #ff0000 100%);
+border-radius: 50%;
+position: absolute;
+top: 50%;
+left: 50%;
+transform: translate(-50%, -50%);
+transition: all 0.1s ease-out;
+}
+
+#grinPath {
+filter: drop-shadow(0 0 12px #ff00ff);
+}
+
+#video {
+position: absolute;
+top: 10px;
+right: 10px;
+width: 160px;
+height: 120px;
+border: 2px solid #00ffff;
+display: none;
+z-index: 5;
+}
+
+#status {
+position: absolute;
+bottom: 15px;
+left: 15px;
+color: #00ffff;
+font-size: 12px;
+background: rgba(0,0,0,0.7);
+padding: 8px 12px;
+border: 1px solid #00ffff;
+z-index: 10;
+max-width: 300px;
+}
+</style>
+
+</head>
+
+<body>
+<div id="ui">
+  <button id="nightmareBtn">☠ NIGHTMARE MODE</button>
+  <button id="eyeTrackBtn">👁 ACTIVATE EYES</button>
+  <button id="showCameraBtn" style="display:none;">📹 SHOW CAMERA</button>
+</div>
+
+<div id="status">Eyes: Sleeping 😴</div>
+
+<video id="video" autoplay playsinline></video>
+
+<div id="cheshire">
+  <div style="text-align:center">
+    <span class="eye" id="eyeL">
+      <div class="pupil" id="pupilL"></div>
+    </span>
+    <span class="eye" id="eyeR">
+      <div class="pupil" id="pupilR"></div>
+    </span>
+  </div>
+  <svg width="160" height="60">
+    <path id="grinPath"
+      d="M10 25 Q80 50 150 25"
+      stroke="#ff00ff"
+      stroke-width="4"
+      fill="none"/>
+  </svg>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<script type="module">
+/* ======================
+   FACE TRACKING SETUP
+====================== */
+import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+let faceDetector;
+let trackingActive = false;
+let cameraActive = false;
+let lastFacePosition = { x: 0.5, y: 0.5 }; // normalized 0-1
+let useMouseFallback = false;
+let wakeLock = null;
+let detectionRunning = false;
+
+const video = document.getElementById('video');
+const pupilL = document.getElementById('pupilL');
+const pupilR = document.getElementById('pupilR');
+const status = document.getElementById('status');
+const eyeTrackBtn = document.getElementById('eyeTrackBtn');
+const showCameraBtn = document.getElementById('showCameraBtn');
+
+// Initialize face detection with better error handling
+async function initFaceDetection() {
+  try {
+    status.textContent = '⏳ Loading face detection...';
+    
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    
+    faceDetector = await FaceDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO"
+    });
+    
+    console.log('✓ Face detector initialized');
+    return true;
+  } catch (err) {
+    console.error('Face detection initialization failed:', err);
+    status.textContent = '❌ Face detection failed. Using mouse mode.';
+    useMouseFallback = true;
+    return false;
+  }
+}
+
+// Request Wake Lock to keep screen on
+async function requestWakeLock() {
+  if ('wakeLock' in navigator) {
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      console.log('✓ Wake Lock active - screen will stay on');
+      
+      wakeLock.addEventListener('release', () => {
+        console.log('Wake Lock released');
+      });
+      
+      return true;
+    } catch (err) {
+      console.log('Wake Lock not available:', err);
+      return false;
+    }
+  } else {
+    console.log('Wake Lock API not supported');
+    return false;
+  }
+}
+
+// Release Wake Lock
+async function releaseWakeLock() {
+  if (wakeLock !== null) {
+    try {
+      await wakeLock.release();
+      wakeLock = null;
+      console.log('Wake Lock released');
+    } catch (err) {
+      console.error('Error releasing wake lock:', err);
+    }
+  }
+}
+
+// Start camera with better error handling
+async function startCamera() {
+  try {
+    status.textContent = '📹 Requesting camera access...';
+    
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      video: { 
+        facingMode: 'user', 
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      } 
+    });
+    
+    video.srcObject = stream;
+    
+    // Wait for video to be ready
+    await new Promise((resolve, reject) => {
+      video.onloadedmetadata = () => {
+        video.play()
+          .then(resolve)
+          .catch(reject);
+      };
+      video.onerror = reject;
+      
+      // Timeout after 5 seconds
+      setTimeout(() => reject(new Error('Video load timeout')), 5000);
+    });
+    
+    cameraActive = true;
+    showCameraBtn.style.display = 'block';
+    status.textContent = '👁 Eyes: WATCHING YOU';
+    
+    console.log('✓ Camera started successfully');
+    return true;
+  } catch (err) {
+    console.error('Camera access error:', err);
+    
+    if (err.name === 'NotAllowedError') {
+      status.textContent = '🚫 Camera denied. Using mouse mode. (Allow camera in settings)';
+    } else if (err.name === 'NotFoundError') {
+      status.textContent = '📷 No camera found. Using mouse mode.';
+    } else {
+      status.textContent = '🖱 Camera unavailable. Using mouse mode.';
+    }
+    
+    useMouseFallback = true;
+    return false;
+  }
+}
+
+// Toggle camera visibility
+showCameraBtn.onclick = () => {
+  video.style.display = video.style.display === 'none' ? 'block' : 'none';
+};
+
+// Detect face and update eye position with better checks
+async function detectFace() {
+  if (!trackingActive || !faceDetector) {
+    detectionRunning = false;
+    return;
+  }
+  
+  detectionRunning = true;
+  
+  try {
+    // Only detect if camera is active and video is ready
+    if (cameraActive && video.readyState >= video.HAVE_CURRENT_DATA) {
+      const startTime = performance.now();
+      const detections = faceDetector.detectForVideo(video, startTime);
+      
+      if (detections && detections.detections && detections.detections.length > 0) {
+        const face = detections.detections[0].boundingBox;
+        
+        // Normalize face center position (0-1 range)
+        // Note: we invert X because camera is mirrored
+        lastFacePosition.x = 1 - ((face.originX + face.width / 2) / video.videoWidth);
+        lastFacePosition.y = (face.originY + face.height / 2) / video.videoHeight;
+      }
+    }
+  } catch (err) {
+    console.error('Detection error:', err);
+    // Continue tracking despite errors
+  }
+  
+  // Keep detecting
+  requestAnimationFrame(detectFace);
+}
+
+// Move pupils based on target position
+function movePupils(targetX, targetY) {
+  // Convert screen position to eye movement
+  const maxMove = 8; // pixels from center
+  
+  const offsetX = (targetX - 0.5) * maxMove * 2;
+  const offsetY = (targetY - 0.5) * maxMove * 2;
+  
+  pupilL.style.transform = `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
+  pupilR.style.transform = `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
+}
+
+// Mouse tracking fallback
+document.addEventListener('mousemove', (e) => {
+  if (useMouseFallback && trackingActive) {
+    lastFacePosition.x = e.clientX / window.innerWidth;
+    lastFacePosition.y = e.clientY / window.innerHeight;
+  }
+});
+
+// Activate eye tracking with improved flow
+eyeTrackBtn.onclick = async () => {
+  if (!trackingActive) {
+    // ACTIVATE
+    eyeTrackBtn.textContent = '⏳ ACTIVATING...';
+    eyeTrackBtn.disabled = true;
+    trackingActive = true;
+    
+    // Request wake lock to keep screen on
+    await requestWakeLock();
+    
+    // Initialize face detection if needed
+    if (!faceDetector) {
+      const initialized = await initFaceDetection();
+      if (!initialized) {
+        // Fall back to mouse mode
+        useMouseFallback = true;
+      }
+    }
+    
+    // Try to start camera if not in mouse fallback mode
+    if (!useMouseFallback) {
+      const camStarted = await startCamera();
+      
+      if (camStarted && !detectionRunning) {
+        // Start the detection loop
+        detectFace();
+      }
+    } else {
+      status.textContent = '🖱 Eyes: Mouse Mode Active';
+    }
+    
+    eyeTrackBtn.textContent = '👁 DEACTIVATE EYES';
+    eyeTrackBtn.disabled = false;
+    
+  } else {
+    // DEACTIVATE
+    eyeTrackBtn.textContent = '👁 ACTIVATE EYES';
+    trackingActive = false;
+    detectionRunning = false;
+    status.textContent = 'Eyes: Sleeping 😴';
+    
+    // Release wake lock
+    await releaseWakeLock();
+    
+    // Stop camera
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(track => track.stop());
+      video.srcObject = null;
+      cameraActive = false;
+      video.style.display = 'none';
+      showCameraBtn.style.display = 'none';
+    }
+    
+    // Reset to mouse mode off
+    useMouseFallback = false;
+  }
+};
+
+/* ======================
+   SCENE
+====================== */
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x000000, 0.04);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 1000);
+camera.position.set(0, 6, 18);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+/* ======================
+   LIGHT
+====================== */
+scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+const light = new THREE.PointLight(0xff00ff, 2);
+light.position.set(10,10,10);
+scene.add(light);
+
+// Extra light for monkeys
+const monkeyLight = new THREE.PointLight(0x00ffff, 1.5);
+monkeyLight.position.set(-10, 15, 5);
+scene.add(monkeyLight);
+
+/* ======================
+   WORLD ROOT
+====================== */
+const yggdrasil = new THREE.Group();
+scene.add(yggdrasil);
+
+/* ======================
+   STAIR
+====================== */
+const stair = new THREE.Group();
+const steps = [];
+for (let i=0;i<70;i++) {
+  const mat = new THREE.MeshPhongMaterial({
+    color: new THREE.Color().setHSL(i/70,0.8,0.5),
+    emissive: 0x330033,
+    transparent:true,
+    opacity:0.7
+  });
+  const step = new THREE.Mesh(
+    new THREE.BoxGeometry(1.2,0.15,0.6),
+    mat
+  );
+  const a = i*0.35;
+  step.userData = { baseY: Math.sin(i*0.2)*4 };
+  step.position.set(Math.cos(a)*4, step.userData.baseY, Math.sin(a)*4);
+  stair.add(step);
+  steps.push(step);
+}
+yggdrasil.add(stair);
+
+/* ======================
+   DETAILED FLYING MONKEYS
+   Now with proper anatomy!
+====================== */
+const climbers = new THREE.Group();
+
+function createDetailedMonkey() {
+  const monkey = new THREE.Group();
+  
+  // Color palette - earthy browns with some Wonderland weirdness
+  const furColor = 0x8b4513;
+  const darkFur = 0x5c3317;
+  const accentColor = new THREE.Color().setHSL(Math.random(), 0.7, 0.5);
+  
+  // BODY - elongated torso
+  const bodyGeo = new THREE.SphereGeometry(0.4, 16, 16);
+  const bodyMat = new THREE.MeshPhongMaterial({ 
+    color: furColor,
+    emissive: darkFur,
+    emissiveIntensity: 0.2
+  });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  body.scale.set(0.7, 1.3, 0.7);
+  body.position.y = 0;
+  monkey.add(body);
+  
+  // HEAD - slightly oversized for that unsettling look
+  const headGeo = new THREE.SphereGeometry(0.35, 16, 16);
+  const head = new THREE.Mesh(headGeo, bodyMat);
+  head.scale.set(1, 0.9, 1);
+  head.position.y = 0.7;
+  monkey.add(head);
+  
+  // EARS - big and expressive
+  const earGeo = new THREE.SphereGeometry(0.15, 8, 8);
+  const earMat = new THREE.MeshPhongMaterial({ color: 0xa0826d });
+  const earL = new THREE.Mesh(earGeo, earMat);
+  earL.scale.set(0.7, 1.2, 0.3);
+  earL.position.set(-0.28, 0.75, 0);
+  const earR = earL.clone();
+  earR.position.x = 0.28;
+  monkey.add(earL, earR);
+  
+  // SNOUT - protruding muzzle
+  const snoutGeo = new THREE.SphereGeometry(0.15, 8, 8);
+  const snout = new THREE.Mesh(snoutGeo, new THREE.MeshPhongMaterial({ color: 0xa0826d }));
+  snout.scale.set(0.8, 0.6, 1);
+  snout.position.set(0, 0.6, 0.25);
+  monkey.add(snout);
+  
+  // EYES - glowing and slightly mad
+  const eyeGeo = new THREE.SphereGeometry(0.08, 8, 8);
+  const eyeMat = new THREE.MeshPhongMaterial({ 
+    color: 0xffff00,
+    emissive: 0xffff00,
+    emissiveIntensity: 0.8
+  });
+  const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+  eyeL.position.set(-0.12, 0.72, 0.28);
+  const eyeR = eyeL.clone();
+  eyeR.position.x = 0.12;
+  monkey.add(eyeL, eyeR);
+  
+  // ARMS - long and gangly
+  const armGeo = new THREE.CylinderGeometry(0.08, 0.06, 0.6, 8);
+  const armL = new THREE.Mesh(armGeo, bodyMat);
+  armL.position.set(-0.35, 0.1, 0);
+  armL.rotation.z = 0.5;
+  const armR = armL.clone();
+  armR.position.x = 0.35;
+  armR.rotation.z = -0.5;
+  monkey.add(armL, armR);
+  
+  // HANDS - little spheres at the ends
+  const handGeo = new THREE.SphereGeometry(0.1, 6, 6);
+  const handL = new THREE.Mesh(handGeo, new THREE.MeshPhongMaterial({ color: 0x6d5d52 }));
+  handL.position.set(-0.56, -0.15, 0);
+  const handR = handL.clone();
+  handR.position.x = 0.56;
+  monkey.add(handL, handR);
+  
+  // LEGS - tucked up in flight
+  const legGeo = new THREE.CylinderGeometry(0.09, 0.07, 0.5, 8);
+  const legL = new THREE.Mesh(legGeo, bodyMat);
+  legL.position.set(-0.2, -0.5, 0);
+  legL.rotation.x = 0.8;
+  const legR = legL.clone();
+  legR.position.x = 0.2;
+  monkey.add(legL, legR);
+  
+  // TAIL - long, striped, and curly (very Wonderland!)
+  const tailSegments = 8;
+  const tailGroup = new THREE.Group();
+  for (let i = 0; i < tailSegments; i++) {
+    const segGeo = new THREE.SphereGeometry(0.06 - i * 0.005, 6, 6);
+    const isStripe = i % 2 === 0;
+    const segMat = new THREE.MeshPhongMaterial({ 
+      color: isStripe ? furColor : accentColor 
+    });
+    const seg = new THREE.Mesh(segGeo, segMat);
+    seg.position.y = -i * 0.15;
+    seg.position.x = Math.sin(i * 0.3) * 0.1;
+    tailGroup.add(seg);
+  }
+  tailGroup.position.set(0, -0.5, -0.3);
+  tailGroup.rotation.x = -0.5;
+  monkey.add(tailGroup);
+  
+  // WINGS - large, dramatic bat-like wings with structure
+  const wings = new THREE.Group();
+  const wingMat = new THREE.MeshPhongMaterial({
+    color: accentColor,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.75,
+    emissive: accentColor,
+    emissiveIntensity: 0.3
+  });
+  
+  // Wing membrane shape - more organic and bat-like
+  const createWing = (side) => {
+    const wingGroup = new THREE.Group();
+    
+    // Wing bones/arms extending from body
+    const boneGeo = new THREE.CylinderGeometry(0.04, 0.02, 0.8, 6);
+    const boneMat = new THREE.MeshPhongMaterial({ color: darkFur });
+    
+    const bone1 = new THREE.Mesh(boneGeo, boneMat);
+    bone1.rotation.z = side * 0.3;
+    bone1.position.x = side * 0.4;
+    bone1.position.y = 0.3;
+    
+    const bone2 = new THREE.Mesh(boneGeo, boneMat);
+    bone2.rotation.z = side * -0.2;
+    bone2.position.x = side * 0.7;
+    bone2.position.y = 0.5;
+    bone2.scale.set(0.8, 1, 0.8);
+    
+    wingGroup.add(bone1, bone2);
+    
+    // Wing membrane - multiple segments for that fleshy bat look
+    const shapes = [];
+    const shape1 = new THREE.Shape();
+    shape1.moveTo(0, 0);
+    shape1.quadraticCurveTo(side * 0.6, 0.4, side * 1.2, 0.2);
+    shape1.quadraticCurveTo(side * 1.0, -0.3, side * 0.5, -0.4);
+    shape1.quadraticCurveTo(side * 0.2, -0.2, 0, 0);
+    
+    const wingMesh1 = new THREE.Mesh(
+      new THREE.ShapeGeometry(shape1),
+      wingMat
+    );
+    wingMesh1.position.y = 0.3;
+    
+    const shape2 = new THREE.Shape();
+    shape2.moveTo(side * 0.5, -0.4);
+    shape2.quadraticCurveTo(side * 0.9, -0.6, side * 1.1, -0.3);
+    shape2.quadraticCurveTo(side * 0.8, 0, side * 0.5, -0.4);
+    
+    const wingMesh2 = new THREE.Mesh(
+      new THREE.ShapeGeometry(shape2),
+      wingMat
+    );
+    wingMesh2.position.y = 0.3;
+    
+    wingGroup.add(wingMesh1, wingMesh2);
+    return wingGroup;
+  };
+  
+  const leftWing = createWing(-1);
+  const rightWing = createWing(1);
+  
+  wings.add(leftWing, rightWing);
+  wings.position.y = 0.2;
+  monkey.add(wings);
+  
+  // Store references for animation
+  monkey.userData = {
+    wings,
+    leftWing,
+    rightWing,
+    tail: tailGroup,
+    arms: [armL, armR],
+    hands: [handL, handR],
+    legs: [legL, legR],
+    eyes: [eyeL, eyeR],
+    offset: Math.random(),
+    spiralOffset: Math.random() * Math.PI * 2,
+    bobPhase: Math.random() * Math.PI * 2,
+    flightStyle: Math.random() // Different monkeys have different flight chaos
+  };
+  
+  return monkey;
+}
+
+// Create 5 monkeys for more chaos
+for (let i = 0; i < 5; i++) {
+  climbers.add(createDetailedMonkey());
+}
+yggdrasil.add(climbers);
+
+/* ======================
+   NIGHTMARE
+====================== */
+let nightmare = false;
+document.getElementById("nightmareBtn").onclick = () => nightmare = !nightmare;
+
+/* ======================
+   GRIN REACTION
+====================== */
+const grin = document.getElementById("grinPath");
+const eyeL = document.getElementById("eyeL");
+const eyeR = document.getElementById("eyeR");
+
+/* ======================
+   ANIMATE
+====================== */
+let t = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  t += 0.01;
+
+  // WORLD DECAY
+  if (nightmare) {
+    yggdrasil.rotation.x = Math.sin(t * 0.7) * 0.2;
+    yggdrasil.rotation.z = Math.cos(t * 0.6) * 0.2;
+    camera.position.x = Math.sin(t * 3) * 0.5;
+    camera.position.y = 6 + Math.sin(t * 2) * 0.5;
+    scene.fog.density = 0.06;
+  } else {
+    yggdrasil.rotation.y += 0.002;
+    scene.fog.density = 0.04;
+  }
+
+  // STAIR DISTORT
+  steps.forEach((s, i) => {
+    s.position.y = s.userData.baseY + Math.sin(t * 2 + i) * (nightmare ? 1.2 : 0.3);
+  });
+
+  // DETAILED MONKEY ANIMATION
+  climbers.children.forEach((monkey, i) => {
+    const ud = monkey.userData;
+    
+    // Spiral flight path with individual variation
+    const p = (t * 0.08 + ud.offset) % 1;
+    const spiralTightness = nightmare ? 5 : 6;
+    const a = p * Math.PI * spiralTightness + ud.spiralOffset;
+    
+    // Radius oscillates for more organic movement
+    const radiusBase = 4;
+    const radiusVar = Math.sin(t * 2 + i) * (nightmare ? 1.5 : 0.5);
+    const radius = radiusBase + radiusVar;
+    
+    // Position with chaotic bob
+    const bobAmount = nightmare ? 0.8 : 0.4;
+    const bob = Math.sin(t * 4 + ud.bobPhase) * bobAmount;
+    
+    monkey.position.set(
+      Math.cos(a) * radius,
+      Math.sin(p * Math.PI * 4) * 4 + 1 + bob,
+      Math.sin(a) * radius
+    );
+    
+    // Rotation - monkeys bank and roll as they fly
+    monkey.rotation.y = a + Math.PI / 2;
+    monkey.rotation.z = Math.sin(t * 3 + i) * (nightmare ? 0.4 : 0.2);
+    monkey.rotation.x = Math.sin(p * Math.PI * 2) * 0.3;
+    
+    // WING FLAPPING - dramatic and organic
+    const flapSpeed = nightmare ? 12 : 8;
+    const flapAngle = Math.sin(t * flapSpeed + i) * (nightmare ? 1.2 : 0.8);
+    
+    ud.leftWing.rotation.y = flapAngle;
+    ud.rightWing.rotation.y = -flapAngle;
+    
+    // Wing tips curl during flap
+    ud.leftWing.rotation.z = Math.sin(t * flapSpeed + i) * 0.3;
+    ud.rightWing.rotation.z = -Math.sin(t * flapSpeed + i) * 0.3;
+    
+    // TAIL CURL - writhing motion
+    ud.tail.rotation.z = Math.sin(t * 3 + i) * 0.5;
+    ud.tail.rotation.x = -0.5 + Math.cos(t * 2.5 + i) * 0.3;
+    
+    // ARM FLAILING - reaching and grasping
+    ud.arms[0].rotation.z = 0.5 + Math.sin(t * 5 + i) * 0.4;
+    ud.arms[1].rotation.z = -0.5 - Math.sin(t * 5 + i + 1) * 0.4;
+    ud.arms[0].rotation.x = Math.cos(t * 4 + i) * 0.3;
+    ud.arms[1].rotation.x = Math.cos(t * 4 + i + 1.5) * 0.3;
+    
+    // HAND GRABBING MOTION
+    const grabCycle = Math.sin(t * 6 + i);
+    ud.hands[0].scale.setScalar(0.8 + grabCycle * 0.3);
+    ud.hands[1].scale.setScalar(0.8 - grabCycle * 0.3);
+    
+    // LEG TUCKING - pedaling motion
+    ud.legs[0].rotation.x = 0.8 + Math.sin(t * 7 + i) * 0.5;
+    ud.legs[1].rotation.x = 0.8 + Math.sin(t * 7 + i + Math.PI) * 0.5;
+    
+    // EYE GLOW PULSES - especially in nightmare mode
+    const eyeGlow = nightmare ? 0.8 + Math.sin(t * 8 + i) * 0.2 : 0.5;
+    ud.eyes.forEach(eye => {
+      eye.material.emissiveIntensity = eyeGlow;
+    });
+  });
+
+  // GRIN LIVES
+  const pulse = Math.sin(t * 4) * (nightmare ? 20 : 6);
+  grin.setAttribute("d", `M10 25 Q80 ${40 + pulse} 150 25`);
+  
+  // EYE TRACKING - Update pupils based on face/mouse position
+  if (trackingActive) {
+    movePupils(lastFacePosition.x, lastFacePosition.y);
+  } else {
+    // Original random movement when not tracking
+    eyeL.style.transform = `translate(${Math.sin(t * 2) * 4}px, ${Math.cos(t * 3) * 4}px)`;
+    eyeR.style.transform = `translate(${Math.cos(t * 2) * 4}px, ${Math.sin(t * 3) * 4}px)`;
+  }
+
+  camera.lookAt(0, 2, 0);
+  renderer.render(scene, camera);
+}
+animate();
+
+window.onresize = () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+};
+
+// Handle page visibility changes - re-request wake lock when page becomes visible
+document.addEventListener('visibilitychange', async () => {
+  if (!document.hidden && trackingActive && wakeLock === null) {
+    await requestWakeLock();
+  }
+});
+</script>
+
+</body>
+</html>
